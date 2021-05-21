@@ -1458,6 +1458,9 @@ add_default_gensio_accepters(void *cb_data)
     REG_FILT_GENSIO_ACC(o, "certauth",
 			str_to_certauth_gensio_accepter,
 			certauth_gensio_accepter_alloc);
+    REG_FILT_GENSIO_ACC(o, "pamauth",
+			str_to_pamauth_gensio_accepter,
+			pamauth_gensio_accepter_alloc);
     REG_FILT_GENSIO_ACC(o, "telnet", str_to_telnet_gensio_accepter,
 			telnet_gensio_accepter_alloc);
     REG_GENSIO_ACC(o, "dummy", str_to_dummy_gensio_accepter);

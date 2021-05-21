@@ -14,6 +14,7 @@ set(BASE_LIBFILES
   gensio.c
   gensio_ll_ipmisol.c
   gensio_certauth.c
+  gensio_pamauth.c
   gensio_msgdelim.c
   sergensio.c
   gensio_dummy.c

@@ -18,6 +18,7 @@ libgensio_la_SOURCES = \
 	gensio_ssl.c gensio_filter_ssl.c \
 	gensio_ll_ipmisol.c sergensio_ipmisol.c \
 	gensio_filter_certauth.c gensio_certauth.c \
+	gensio_filter_pamauth.c gensio_pamauth.c \
 	gensio_dummy.c gensio_echo.c gensio_mux.c gensio_file.c \
 	gensio_filter_msgdelim.c gensio_msgdelim.c \
 	gensio_filter_relpkt.c gensio_relpkt.c \
