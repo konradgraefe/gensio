@@ -31,6 +31,7 @@ case $target_os in
 		;;
 	linux*)
 		UUCP_LOCK_DIR=/var/lock
+		LIBS="-lpam"
 		;;
 	darwin*)
 		broken_pselect=yes

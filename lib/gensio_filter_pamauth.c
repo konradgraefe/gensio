@@ -4,6 +4,8 @@
 #include <gensio/gensio_os_funcs.h>
 #include <gensio/gensio_class.h>
 
+#include <security/pam_appl.h>
+
 #include <assert.h>
 #include <string.h>
 
@@ -26,10 +28,22 @@ struct gensio_pamauth_filter_data {
 #define PAMAUTH_RESULT_FAILURE	2
 #define PAMAUTH_RESULT_ERR	3
 
+/*
+ * Ambiguity in spec: is it an array of pointers or a pointer to an array?
+ * Stolen from openssh.
+ */
+#ifdef PAM_SUN_CODEBASE
+# define PAM_MSG_MEMBER(msg, n, member) ((*(msg))[(n)].member)
+#else
+# define PAM_MSG_MEMBER(msg, n, member) ((msg)[(n)]->member)
+#endif
+
 enum pamauth_state {
-    PAMAUTH_PROMPT,
-    PAMAUTH_PASSWORD,
+    PAMAUTH_AUTHENTICATE,
+    PAMAUTH_REQUEST,
+    PAMAUTH_RESPONSE,
     PAMAUTH_PASSTHROUGH,
+    PAMAUTH_ERROR,
 };
 
 struct pamauth_filter {
@@ -42,6 +56,17 @@ struct pamauth_filter {
     enum pamauth_state state;
     bool allow_authfail;
     bool use_child_auth;
+
+    pam_handle_t *pamh;
+    struct pam_conv pam_conv;
+    int pam_num_msg;
+    int pam_msg_idx;
+
+    struct pam_message *pam_msg;
+    struct pam_response *pam_resp;
+
+    char *response_buf;
+    gensiods response_len;
 
     unsigned char *read_buf;
     gensiods read_buf_len;
@@ -230,8 +255,9 @@ pamauth_try_connect(struct gensio_filter *filter, gensio_time *timeout)
     struct gensio *io;
     gensiods len;
     bool password_requested = false;
-    int err;
+    int err, pam_err, i;
     int rv;
+    struct pam_message *msg;
 
     pamauth_lock(sfilter);
 
@@ -244,28 +270,63 @@ pamauth_try_connect(struct gensio_filter *filter, gensio_time *timeout)
 	goto exit;
     }
 
-    switch (sfilter->state) {
-    case PAMAUTH_PROMPT:
+    if (sfilter->state == PAMAUTH_RESPONSE) {
+	sfilter->pam_msg_idx++;
+
+	if (sfilter->pam_msg_idx == sfilter->pam_num_msg) {
+	    sfilter->state = PAMAUTH_AUTHENTICATE;
+	} else {
+	    sfilter->state = PAMAUTH_REQUEST;
+	}
+    }
+
+    if (sfilter->state == PAMAUTH_AUTHENTICATE) {
 	sfilter->write_buf_len = 0; /* TODO */
 	sfilter->read_buf_len = 0;
-	pamauth_write_str(sfilter, "Enter password: ");
-	sfilter->state = PAMAUTH_PASSWORD;
-	rv = GE_INPROGRESS;
-	break;
 
-    case PAMAUTH_PASSWORD:
-	if (strcmp(sfilter->read_buf, "harhar") == 0) {
+	pam_err = pam_authenticate(sfilter->pamh, PAM_SILENT);
+	if (pam_err == PAM_SUCCESS) {
+	    /* TODO: Check more things? see gtlsshd */
 	    sfilter->state = PAMAUTH_PASSTHROUGH;
 	    rv = 0;
-	} else {
-	    sfilter->read_buf_len = 0;
-	    pamauth_write_str(sfilter, "Enter password: ");
+	} else if (pam_err == PAM_AUTHINFO_UNAVAIL && sfilter->pam_num_msg > 0) {
+	    sfilter->state = PAMAUTH_REQUEST;
 	    rv = GE_INPROGRESS;
+	} else {
+	    gensio_log(sfilter->o, GENSIO_LOG_ERR,
+		"PAM authentication failed: %s (%d)",
+		pam_strerror(sfilter->pamh, pam_err),
+		pam_err
+	    );
+	    sfilter->state = PAMAUTH_ERROR;
+	    rv = GE_AUTHREJECT;
 	}
-	break;
+    }
 
-    default:
-	assert(false);
+    if (sfilter->state == PAMAUTH_REQUEST) {
+	do {
+	    msg = &sfilter->pam_msg[ sfilter->pam_msg_idx ];
+
+	    pamauth_write_str(sfilter, msg->msg);
+
+	    if (msg->msg_style == PAM_ERROR_MSG) {
+		sfilter->state = PAMAUTH_ERROR;
+		rv = GE_AUTHREJECT;
+		break;
+	    }
+	    if (msg->msg_style == PAM_PROMPT_ECHO_ON
+		|| msg->msg_style == PAM_PROMPT_ECHO_OFF
+	    ) {
+		/* TODO: Switch off echo on PAM_PROMPT_ECHO_OFF */
+		sfilter->state = PAMAUTH_RESPONSE;
+		sfilter->response_len = 0;
+		sfilter->response_buf = sfilter->pam_resp[ sfilter->pam_msg_idx ].resp;
+		rv = GE_INPROGRESS;
+		break;
+	    }
+
+	    sfilter->pam_msg_idx++;
+	} while(msg->msg_style == PAM_TEXT_INFO);
     }
 
     sfilter->got_msg = false;
@@ -330,10 +391,10 @@ pamauth_ll_write(struct gensio_filter *filter,
 		  const char *const *auxdata)
 {
     struct pamauth_filter *sfilter = filter_to_pamauth(filter);
-    int err = 0;
+    int err = 0, i;
     unsigned char *obuf = buf;
     unsigned char *nl;
-    gensiods chunkLen;
+    gensiods chunklen;
 
     if (buflen == 0)
 	goto out;
@@ -361,34 +422,40 @@ pamauth_ll_write(struct gensio_filter *filter,
 	goto out_unlock;
     }
 
+    if (sfilter->state != PAMAUTH_RESPONSE) {
+	/* Ignore data in that state */
+	if (rcount)
+	    *rcount = buflen;
+	goto out_unlock;
+    }
+
     nl = memchr(buf, '\n', buflen);
     if (!nl) {
 	/* No newline found. Just copy into our receive buffer if it fits */
 
-	/* TODO: Check overflow? */
-	if (sfilter->read_buf_len + buflen > GENSIO_PAMAUTH_DATA_SIZE) {
+	if (sfilter->response_len + buflen > PAM_MAX_RESP_SIZE) {
 	    sfilter->pending_err = GE_NOMEM;
 	    goto out_unlock;
 	}
 
-	memcpy(sfilter->read_buf + sfilter->read_buf_len, buf, buflen);
-	sfilter->read_buf_len += buflen;
+	memcpy(sfilter->response_buf + sfilter->response_len, buf, buflen);
+	sfilter->response_len += buflen;
 	buf += buflen;
+
 	goto out_unlock;
     }
 
-    chunkLen = nl - buf + 1;
+    chunklen = nl - buf + 1;
 
-    /* TODO: Check overflow? */
-    if (sfilter->read_buf_len + chunkLen > GENSIO_PAMAUTH_DATA_SIZE) {
+    if (sfilter->response_len + chunklen > PAM_MAX_RESP_SIZE) {
 	sfilter->pending_err = GE_NOMEM;
 	goto out_unlock;
     }
 
-    memcpy(sfilter->read_buf + sfilter->read_buf_len, buf, chunkLen);
-    sfilter->read_buf_len += chunkLen;
-    sfilter->read_buf[sfilter->read_buf_len - 1] = '\0';
-    buf += chunkLen;
+    memcpy(sfilter->response_buf + sfilter->response_len, buf, chunklen);
+    sfilter->response_len += chunklen;
+    sfilter->response_buf[sfilter->response_len - 1] = '\0';
+    buf += chunklen;
 
     sfilter->got_msg = true;
 
@@ -484,6 +551,54 @@ int gensio_pamauth_filter_func(struct gensio_filter *filter, int op,
     }
 }
 
+static int
+pam_conversation_cb(int num_msg, const struct pam_message **msg,
+		    struct pam_response **resp, void *appdata_ptr)
+{
+    struct pamauth_filter *sfilter = appdata_ptr;
+    struct gensio_os_funcs *o = sfilter->o;
+    int i;
+
+    if (num_msg <= 0 || num_msg > PAM_MAX_NUM_MSG)
+	return PAM_CONV_ERR;
+
+    if (sfilter->pam_msg == NULL) {
+	/* Copy messages */
+	/* TODO free all the things! */
+	sfilter->pam_msg_idx = 0;
+	sfilter->pam_num_msg = num_msg;
+	sfilter->pam_msg = o->zalloc(o, sizeof(struct pam_message) * num_msg);
+
+	for (i = 0; i < num_msg; i++) {
+	    gensio_log(sfilter->o,
+		GENSIO_LOG_ERR,
+		"PAM message: %s",
+		PAM_MSG_MEMBER(msg, i, msg)
+	    );
+	    sfilter->pam_msg[i].msg_style = PAM_MSG_MEMBER(msg, i, msg_style);
+	    sfilter->pam_msg[i].msg = gensio_strdup(o, PAM_MSG_MEMBER(msg, i, msg));
+	}
+
+	sfilter->pam_resp = o->zalloc(o, sizeof(struct pam_response) * num_msg);
+	for (i = 0; i < num_msg; i++) {
+	    sfilter->pam_resp[i].resp = o->zalloc(o, PAM_MAX_RESP_SIZE);
+	}
+
+	return PAM_CONV_AGAIN;
+    } else {
+	for (i = 0; i < sfilter->pam_num_msg; i++) {
+	    o->free(o, (char *)sfilter->pam_msg[i].msg);
+	}
+	o->free(o, sfilter->pam_msg);
+	sfilter->pam_msg = NULL;
+
+	*resp = sfilter->pam_resp; /* This is free'd by the caller */
+	sfilter->pam_resp = NULL;
+
+	return PAM_SUCCESS;
+    }
+}
+
 int
 gensio_pamauth_filter_alloc(struct gensio_pamauth_filter_data *data,
 			    struct gensio_filter **rfilter)
@@ -491,7 +606,7 @@ gensio_pamauth_filter_alloc(struct gensio_pamauth_filter_data *data,
     struct gensio_os_funcs *o = data->o;
     struct gensio_filter *filter;
     struct pamauth_filter *sfilter;
-    int rv;
+    int rv, pam_err;
 
     sfilter = o->zalloc(o, sizeof(*sfilter));
     if (!sfilter)
@@ -505,7 +620,7 @@ gensio_pamauth_filter_alloc(struct gensio_pamauth_filter_data *data,
     if (!sfilter->lock)
 	goto out_nomem;
 
-    sfilter->state = PAMAUTH_PROMPT;
+    sfilter->state = PAMAUTH_AUTHENTICATE;
     sfilter->got_msg = true; /* Go ahead and run the state machine. */
 
     sfilter->read_buf = o->zalloc(o, GENSIO_PAMAUTH_DATA_SIZE);
@@ -523,9 +638,28 @@ gensio_pamauth_filter_alloc(struct gensio_pamauth_filter_data *data,
     if (!sfilter->filter)
 	goto out_nomem;
 
+    sfilter->pam_conv.conv = pam_conversation_cb;
+    sfilter->pam_conv.appdata_ptr = sfilter;
+    /* TODO pam_end() */
+    pam_err = pam_start(
+	"ser2net", /* TODO: Do not hard code */
+	"bob",     /* TODO: Add an option to specify user and ask if not set */
+	&sfilter->pam_conv,
+	&sfilter->pamh
+    );
+    if (pam_err != PAM_SUCCESS) {
+	gensio_log(sfilter->o,
+	    GENSIO_LOG_ERR,
+	    "Unable to start PAM transaction: %s",
+	    pam_strerror(sfilter->pamh, pam_err)
+	);
+	goto out_err;
+    }
+
     *rfilter = sfilter->filter;
     return 0;
 
+ /* TODO: clean up properly */
  out_nomem:
     rv = GE_NOMEM;
  out_err:
